@@ -102,6 +102,7 @@ class MobileOneBlock(nn.Module):
         self.activation = nn.ReLU()
 
         if inference_mode:
+            # 如果是推断模式的话，这里是直接生成一个fuse后的结构，然后靠读进来的权重初始化
             self.reparam_conv = nn.Conv2d(in_channels=in_channels,
                                           out_channels=out_channels,
                                           kernel_size=kernel_size,
@@ -111,18 +112,26 @@ class MobileOneBlock(nn.Module):
                                           groups=groups,
                                           bias=True)
         else:
-            # Re-parameterizable skip connection
+            # 论文中，有两种结构
+            # 结构一：1X1 Conv+BN、(3X3dw Conv + BN) List、BN
+            # 结构二：(1X1 Conv + BN) List + BN
+
+            # Re-parameterizable skip connection, 按照这个逻辑，结构一的情况下，这里应该就是单纯的ResConnect
             self.rbr_skip = nn.BatchNorm2d(num_features=in_channels) \
                 if out_channels == in_channels and stride == 1 else None
 
             # Re-parameterizable conv branches
+            # 先保存在List里
             rbr_conv = list()
             for _ in range(self.num_conv_branches):
                 rbr_conv.append(self._conv_bn(kernel_size=kernel_size,
                                               padding=padding))
+            # nn.ModuleList 是 PyTorch 中用于存储一组 nn.Module 子模块的特殊容器，功能类似于 Python 的普通 list，但它有一个关键区别：
+            # nn.ModuleList 会让其中的子模块被 PyTorch 正确注册，参与到参数管理（如 model.parameters()）、GPU 转移（如 model.to(device)）、保存/加载（state_dict）等过程中。
             self.rbr_conv = nn.ModuleList(rbr_conv)
 
             # Re-parameterizable scale branch
+            # 这个是结构一里那个1X1 conv
             self.rbr_scale = None
             if kernel_size > 1:
                 self.rbr_scale = self._conv_bn(kernel_size=1,
@@ -146,6 +155,7 @@ class MobileOneBlock(nn.Module):
             scale_out = self.rbr_scale(x)
 
         # Other branches
+        # 所以还是并行计算
         out = scale_out + identity_out
         for ix in range(self.num_conv_branches):
             out += self.rbr_conv[ix](x)
@@ -161,6 +171,7 @@ class MobileOneBlock(nn.Module):
         if self.inference_mode:
             return
         kernel, bias = self._get_kernel_bias()
+        # 在上面获取了融合后的 Kernel 和 Bias 权重后，直接生成一个Conv，把Kernel和Bias给进去就好了
         self.reparam_conv = nn.Conv2d(in_channels=self.rbr_conv[0].conv.in_channels,
                                       out_channels=self.rbr_conv[0].conv.out_channels,
                                       kernel_size=self.rbr_conv[0].conv.kernel_size,
@@ -188,23 +199,24 @@ class MobileOneBlock(nn.Module):
 
         :return: Tuple of (kernel, bias) after fusing branches.
         """
-        # get weights and bias of scale branch
+        # scale分支
         kernel_scale = 0
         bias_scale = 0
         if self.rbr_scale is not None:
             kernel_scale, bias_scale = self._fuse_bn_tensor(self.rbr_scale)
-            # Pad scale branch kernel to match conv branch kernel size.
-            pad = self.kernel_size // 2
+            # scale 分支一般是1x1的，而主分支是3x3的，所以需要统一卷积核尺寸
+            pad = self.kernel_size // 2 # 这里是算出需要pad几个
+            # 扩充kernel，里面的数组对应的是在[left, right, top, bottom]上要pad几个单元
             kernel_scale = torch.nn.functional.pad(kernel_scale,
                                                    [pad, pad, pad, pad])
 
-        # get weights and bias of skip branch
+        # skip 分支
         kernel_identity = 0
         bias_identity = 0
         if self.rbr_skip is not None:
             kernel_identity, bias_identity = self._fuse_bn_tensor(self.rbr_skip)
 
-        # get weights and bias of conv branches
+        # Conv 分支
         kernel_conv = 0
         bias_conv = 0
         for ix in range(self.num_conv_branches):
@@ -212,6 +224,7 @@ class MobileOneBlock(nn.Module):
             kernel_conv += _kernel
             bias_conv += _bias
 
+        # 分别获取三个分支的kernel和bias以后，直接相加
         kernel_final = kernel_conv + kernel_scale + kernel_identity
         bias_final = bias_conv + bias_scale + bias_identity
         return kernel_final, bias_final
@@ -223,6 +236,7 @@ class MobileOneBlock(nn.Module):
         :param branch:
         :return: Tuple of (kernel, bias) after fusing batchnorm.
         """
+        # 说明这是 卷积+BN 分支，直接提取卷积权重和 BN 参数。
         if isinstance(branch, nn.Sequential):
             kernel = branch.conv.weight
             running_mean = branch.bn.running_mean
@@ -231,8 +245,13 @@ class MobileOneBlock(nn.Module):
             beta = branch.bn.bias
             eps = branch.bn.eps
         else:
+            # 说明这是 identity 分支，则生成一个单位卷积核，并融合 BN。
             assert isinstance(branch, nn.BatchNorm2d)
+            # 检查是否已经生成过单位卷积核，id_tensor是存放kernel值的，只要是生成了核，就会有
             if not hasattr(self, 'id_tensor'):
+                # //是整除。
+                # 如果不分组的话，卷积核的个数是input x output个。
+                # 如果是depthwise卷积的话，则只有input个核。
                 input_dim = self.in_channels // self.groups
                 kernel_value = torch.zeros((self.in_channels,
                                             input_dim,
@@ -240,21 +259,29 @@ class MobileOneBlock(nn.Module):
                                             self.kernel_size),
                                            dtype=branch.weight.dtype,
                                            device=branch.weight.device)
+
+                #中心赋值为1
                 for i in range(self.in_channels):
                     kernel_value[i, i % input_dim,
                                  self.kernel_size // 2,
                                  self.kernel_size // 2] = 1
+
+                # 存入self.id_tensor，其实这个玩意有点像标志位
                 self.id_tensor = kernel_value
+
             kernel = self.id_tensor
             running_mean = branch.running_mean
             running_var = branch.running_var
             gamma = branch.weight
             beta = branch.bias
             eps = branch.eps
+
+        # 核融合部分的运算
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
         return kernel * t, beta - running_mean * gamma / std
 
+    # 生成最小结构单元，一个Conv2d + BN
     def _conv_bn(self,
                  kernel_size: int,
                  padding: int) -> nn.Sequential:
@@ -283,6 +310,7 @@ class MobileOne(nn.Module):
         https://arxiv.org/pdf/2206.04040.pdf
     """
     def __init__(self,
+                 #这里跟论文中略有不同，论文中是 2，8，5，5，1
                  num_blocks_per_stage: List[int] = [2, 8, 10, 1],
                  num_classes: int = 1000,
                  width_multipliers: Optional[List[float]] = None,
@@ -304,9 +332,11 @@ class MobileOne(nn.Module):
         self.inference_mode = inference_mode
         self.in_planes = min(64, int(64 * width_multipliers[0]))
         self.use_se = use_se
+        # 这里只有S0是4，其他都是默认值 1
         self.num_conv_branches = num_conv_branches
 
         # Build stages
+        # Stem
         self.stage0 = MobileOneBlock(in_channels=3, out_channels=self.in_planes,
                                      kernel_size=3, stride=2, padding=1,
                                      inference_mode=self.inference_mode)
@@ -334,6 +364,7 @@ class MobileOne(nn.Module):
         :return: A stage of MobileOne model.
         """
         # Get strides for all layers
+        # [1] * (num_blocks - 1) = 生成一个长度为 (num_blocks - 1) 的列表，里面所有元素都是 1
         strides = [2] + [1]*(num_blocks-1)
         blocks = []
         for ix, stride in enumerate(strides):
@@ -341,6 +372,7 @@ class MobileOne(nn.Module):
             if num_se_blocks > num_blocks:
                 raise ValueError("Number of SE blocks cannot "
                                  "exceed number of layers.")
+            # 如果使用SE-ReLu，那么就从后往前用。这个基本不用考虑，只有最后一个需要用到SELayer
             if ix >= (num_blocks - num_se_blocks):
                 use_se = True
 
@@ -392,6 +424,7 @@ PARAMS = {
 }
 
 
+# 方法构建入口
 def mobileone(num_classes: int = 1000, inference_mode: bool = False,
               variant: str = "s0") -> nn.Module:
     """Get MobileOne model.
